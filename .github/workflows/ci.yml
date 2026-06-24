@@ -39,12 +39,15 @@ jobs:
       - name: Build Hex (Release, no signing)
         run: |
           set -o pipefail
+          # -skipMacroValidation: SPM macros (Dependencies/TCA/CasePaths/Perception)
+          # otherwise require interactive "trust" approval that xcodebuild can't give in CI.
           xcodebuild \
             -project Hex.xcodeproj \
             -scheme Hex \
             -configuration Release \
             -derivedDataPath build \
             -destination 'generic/platform=macOS' \
+            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="-" \
             build
