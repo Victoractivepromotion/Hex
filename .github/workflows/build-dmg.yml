@@ -1,0 +1,64 @@
+name: Build DMG (unsigned)
+
+# Builds an unsigned Hex.app and packages it into a DMG on every push to main
+# and on manual dispatch. Signing/notarization is a later bonus layer — this
+# produces an installable artifact now without any secrets configured.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-dmg:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build Release (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Hex.xcodeproj \
+            -scheme Hex \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Locate built .app
+        id: app
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find build/Build/Products/Release -maxdepth 1 -name 'Hex.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "Hex.app not found" >&2
+            find build/Build/Products -name '*.app' >&2 || true
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+          STAGING="$(mktemp -d)"
+          cp -R "${{ steps.app.outputs.app_path }}" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          hdiutil create \
+            -volname "Hex" \
+            -srcfolder "$STAGING" \
+            -ov -format UDZO \
+            "Hex.dmg"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hex-dmg
+          path: Hex.dmg
+          if-no-files-found: error
