@@ -17,10 +17,10 @@
 //
 
 import AppKit
+import HexCore
 import WebKit
-import os
 
-private let hudLog = Logger(subsystem: "com.kitlangton.Hex", category: "LarryHUD")
+private let hudLog = HexLog.larryHUD
 
 @MainActor
 final class LarryHUD: NSObject, WKNavigationDelegate {
@@ -32,10 +32,13 @@ final class LarryHUD: NSObject, WKNavigationDelegate {
     case listening
     case thinking
     case speaking
+    case muted
 
     /// (status line, accent colour, sub-line)
     var display: (String, String, String) {
       switch self {
+      case .muted:
+        return ("Muted — tryk højre Option for at lytte igen", "#ff5d6c", "○ Wake-word slået fra · mikrofon frigivet")
       case .standby:
         return ("Standby — lytter efter \"Hey Larry\"", "#3fd8ff", "● Wake-word aktiv · auto-send ved stilhed")
       case .listening:

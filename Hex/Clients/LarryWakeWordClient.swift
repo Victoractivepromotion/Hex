@@ -28,10 +28,10 @@
 
 import AVFoundation
 import Foundation
+import HexCore
 import Speech
-import os
 
-private let wakeLog = Logger(subsystem: "com.kitlangton.Hex", category: "LarryWakeWord")
+private let wakeLog = HexLog.larryWakeWord
 
 @MainActor
 final class LarryWakeWord: NSObject {
@@ -40,11 +40,40 @@ final class LarryWakeWord: NSObject {
   /// Called on the main actor when the phrase is heard.
   var onDetected: (() -> Void)?
 
-  /// Wake word is opt-in: it holds the microphone open for as long as it runs,
-  /// which keeps the system mic indicator lit. Enable with
-  /// `defaults write com.kitlangton.Hex larryWakeWordEnabled -bool true`.
-  static var isEnabled: Bool {
-    UserDefaults.standard.bool(forKey: "larryWakeWordEnabled")
+  /// Wake word is on unless explicitly disabled — the point of the build is
+  /// that you never touch a key. Note this holds the microphone open, so the
+  /// system mic indicator stays lit whenever Larry is listening.
+  /// Turn off permanently with
+  /// `defaults write com.kitlangton.Hex larryWakeWordEnabled -bool false`.
+  /// `nonisolated` because the reducer reads this from the key-event monitor
+  /// and from `.run` effects, neither of which is on the main actor. Backed by
+  /// UserDefaults, which is safe to read from any thread.
+  nonisolated static var isEnabled: Bool {
+    UserDefaults.standard.object(forKey: "larryWakeWordEnabled") == nil
+      ? true
+      : UserDefaults.standard.bool(forKey: "larryWakeWordEnabled")
+  }
+
+  /// Muted by the user with right-Option. Distinct from `isSuspended`, which
+  /// is the short automatic pause while a recording owns the microphone: a
+  /// mute has to survive that pause, so `resume()` must not undo it.
+  private(set) var isMuted = false
+
+  /// Called when the user taps right-Option. Returns the new muted state so
+  /// the caller can reflect it in the UI.
+  @discardableResult
+  func toggleMuted() -> Bool {
+    isMuted.toggle()
+    if isMuted {
+      wakeLog.info("Wake word muted by right-Option")
+      stop()
+      LarryHUD.shared.setState(.muted)
+    } else {
+      wakeLog.info("Wake word unmuted by right-Option")
+      LarryHUD.shared.setState(.standby)
+      Task { await start() }
+    }
+    return isMuted
   }
 
   /// Spellings to accept. On-device recognition rarely returns the exact
@@ -76,7 +105,7 @@ final class LarryWakeWord: NSObject {
 
   /// Requests permission and starts listening. Safe to call more than once.
   func start() async {
-    guard Self.isEnabled else { return }
+    guard Self.isEnabled, !isMuted else { return }
     guard let recognizer, recognizer.isAvailable else {
       wakeLog.error("No speech recogniser available for en-US; wake word disabled")
       return
@@ -124,13 +153,15 @@ final class LarryWakeWord: NSObject {
   func resume() {
     guard isSuspended else { return }
     isSuspended = false
+    // A mute set while recording must outlive the automatic pause.
+    guard !isMuted else { return }
     Task { await start() }
   }
 
   // MARK: Listening
 
   private func listen() {
-    guard !isSuspended, !isRunning else { return }
+    guard !isSuspended, !isMuted, !isRunning else { return }
     stop()
 
     let engine = AVAudioEngine()
@@ -201,7 +232,7 @@ final class LarryWakeWord: NSObject {
   }
 
   private func restartSoon() {
-    guard !isSuspended else { return }
+    guard !isSuspended, !isMuted else { return }
     stop()
     Task { @MainActor in
       try? await Task.sleep(nanoseconds: 200_000_000)

@@ -19,6 +19,9 @@ public enum HexLog {
     case history = "History"
     case settings = "Settings"
     case permissions = "Permissions"
+    case larryVoice = "LarryVoice"
+    case larryWakeWord = "LarryWakeWord"
+    case larryHUD = "LarryHUD"
   }
 
   public static func logger(_ category: Category) -> os.Logger {
@@ -39,4 +42,7 @@ public enum HexLog {
   public static let history = logger(.history)
   public static let settings = logger(.settings)
   public static let permissions = logger(.permissions)
+  public static let larryVoice = logger(.larryVoice)
+  public static let larryWakeWord = logger(.larryWakeWord)
+  public static let larryHUD = logger(.larryHUD)
 }

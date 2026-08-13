@@ -173,6 +173,21 @@ struct TranscriptionFeature {
 // MARK: - Hands-free silence detection
 
 private extension TranscriptionFeature {
+  /// Narrows an "Option, either side" dictation hotkey to the left key while
+  /// the wake word is on, so right-Option is free to mute it.
+  ///
+  /// Hex ships with Option/either as the default hotkey, which means right
+  /// Option would otherwise both start a recording *and* toggle the mute on
+  /// the same press. Only the ambiguous case is rewritten — an explicitly
+  /// chosen hotkey, including a deliberate right-Option one, is left alone.
+  static func dictationHotkey(from hotkey: HotKey) -> HotKey {
+    guard LarryWakeWord.isEnabled, hotkey.key == nil else { return hotkey }
+    guard hotkey.modifiers.matchesExactly([Modifier(kind: .option, side: .either)]) else {
+      return hotkey
+    }
+    return HotKey(key: nil, modifiers: [Modifier(kind: .option, side: .left)])
+  }
+
   /// Bridges "Hey Larry" detections into the reducer. Does nothing unless the
   /// wake word is switched on, so the microphone is only held open when the
   /// feature is actually wanted.
@@ -247,6 +262,8 @@ private extension TranscriptionFeature {
   func startHotKeyMonitoringEffect() -> Effect<Action> {
     .run { send in
       var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
+      /// Tracks a solo right-Option press so the mute toggle fires on release.
+      var rightOptionHeld = false
       @Shared(.isSettingHotKey) var isSettingHotKey: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
 
@@ -258,7 +275,7 @@ private extension TranscriptionFeature {
         }
 
         // Always keep hotKeyProcessor in sync with current user hotkey preference
-        hotKeyProcessor.hotkey = hexSettings.hotkey
+        hotKeyProcessor.hotkey = Self.dictationHotkey(from: hexSettings.hotkey)
         let useDoubleTapOnly = hexSettings.doubleTapLockEnabled && hexSettings.useDoubleTapOnly
         hotKeyProcessor.doubleTapLockEnabled = hexSettings.doubleTapLockEnabled
         hotKeyProcessor.useDoubleTapOnly = useDoubleTapOnly
@@ -273,6 +290,28 @@ private extension TranscriptionFeature {
             Task { await send(.cancel) }
             return false
           }
+
+          // Right-Option on its own mutes and unmutes the wake word. Handled
+          // before the hotkey processor so it can't also start a recording.
+          //
+          // The event is deliberately *not* intercepted: on a Danish layout
+          // Option is how you type @, $, \ and friends, and swallowing it
+          // would break that everywhere. Toggling on release keeps a held
+          // Option-plus-key chord from counting as a tap.
+          if LarryWakeWord.isEnabled, keyEvent.key == nil {
+            let isRightOptionAlone = keyEvent.modifiers.contains(Modifier(kind: .option, side: .right))
+              && keyEvent.modifiers.kinds == [.option]
+            if isRightOptionAlone {
+              rightOptionHeld = true
+              return false
+            }
+            if rightOptionHeld, keyEvent.modifiers.isEmpty {
+              rightOptionHeld = false
+              Task { @MainActor in LarryWakeWord.shared.toggleMuted() }
+              return false
+            }
+          }
+          rightOptionHeld = false
 
           // Process the key event
           switch hotKeyProcessor.process(keyEvent: keyEvent) {

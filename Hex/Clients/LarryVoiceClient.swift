@@ -24,9 +24,9 @@
 
 import AVFoundation
 import Foundation
-import os
+import HexCore
 
-private let larryLog = Logger(subsystem: "com.kitlangton.Hex", category: "LarryVoice")
+private let larryLog = HexLog.larryVoice
 
 enum LarryVoice {
   /// Endpoint on our VPS. Same brain as Discord (memory + tasks + persona).
