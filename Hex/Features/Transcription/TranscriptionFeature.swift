@@ -539,6 +539,17 @@ private extension TranscriptionFeature {
       FileManager.default.removeItemIfExists(at: audioURL)
     }
 
+    // Hey Larry: route the spoken text to Larry's voice brain and speak the
+    // reply instead of pasting raw dictation. Falls back to paste on failure.
+    if LarryVoice.isEnabled {
+      do {
+        _ = try await LarryVoice.ask(result)
+        return
+      } catch {
+        // Endpoint unreachable/slow — degrade gracefully to normal dictation.
+      }
+    }
+
     await pasteboard.paste(result)
     soundEffect.play(.pasteTranscript)
   }
