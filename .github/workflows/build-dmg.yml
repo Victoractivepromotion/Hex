@@ -30,7 +30,12 @@ jobs:
 
       - name: Build Release (unsigned)
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Tee to a file so the compiler diagnostics survive the job. Actions
+          # logs need an authenticated download even on a public repo, so a
+          # failed build is otherwise a dead end for anyone without a token —
+          # the errors get published as a release asset below instead.
+          set +e
           xcodebuild \
             -project Hex.xcodeproj \
             -scheme Hex \
@@ -40,7 +45,15 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             -skipMacroValidation \
-            build
+            build 2>&1 | tee build-full.log
+          status=${PIPESTATUS[0]}
+          set -e
+          # Keep just the diagnostics; the full log is tens of MB.
+          grep -E "error:|warning:.*Larry|BUILD (FAILED|SUCCEEDED)" build-full.log \
+            | sort -u > build-errors.log || true
+          echo "--- diagnostics ---"
+          cat build-errors.log
+          exit "$status"
 
       - name: Locate built .app
         id: app
@@ -83,7 +96,7 @@ jobs:
       # That URL always serves the newest heylarry build and can be curled
       # directly, so installing never needs a manual download again.
       - name: Publish rolling prerelease
-        if: github.ref_name == 'heylarry'
+        if: always() && github.ref_name == 'heylarry'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -91,7 +104,19 @@ jobs:
           # Replace the previous rolling release so the tag always points at
           # this build; ignore failure on the first run when it doesn't exist.
           gh release delete heylarry-latest --yes --cleanup-tag || true
-          gh release create heylarry-latest Hex.dmg \
+          # Attach whatever exists: the DMG on success, the diagnostics either
+          # way, so a failed build can be read without a token.
+          # `[ -f ] &&` returns non-zero when the file is missing, which would
+          # kill the step under set -e, and an empty array trips set -u — hence
+          # the explicit guards.
+          assets=()
+          if [ -f Hex.dmg ]; then assets+=(Hex.dmg); fi
+          if [ -f build-errors.log ]; then assets+=(build-errors.log); fi
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "nothing to publish" >&2
+            exit 0
+          fi
+          gh release create heylarry-latest "${assets[@]}" \
             --prerelease \
             --title "Hey Larry — rolling build" \
             --notes "Unsigned rolling build of the heylarry branch (commit ${GITHUB_SHA}). Replaced on every push."
