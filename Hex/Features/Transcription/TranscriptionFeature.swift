@@ -25,6 +25,17 @@ struct TranscriptionFeature {
     var error: String?
     var recordingStartTime: Date?
     var meter: Meter = .init(averagePower: 0, peakPower: 0)
+
+    /// Set when a recording was started by the wake word rather than the
+    /// hotkey. There is no key to release in that case, so the recording has
+    /// to end itself — see the silence detection in `.audioLevelUpdated`.
+    var isHandsFree: Bool = false
+    /// Last moment the input was loud enough to count as speech.
+    var lastVoiceAt: Date?
+    /// Whether this hands-free utterance has contained any speech yet, so a
+    /// pause *before* you start talking cannot end it immediately.
+    var heardSpeech: Bool = false
+
     var sourceAppBundleID: String?
     var sourceAppName: String?
     @Shared(.hexSettings) var hexSettings: HexSettings
@@ -36,6 +47,9 @@ struct TranscriptionFeature {
   enum Action {
     case task
     case audioLevelUpdated(Meter)
+
+    /// The "Hey Larry" wake word was heard.
+    case wakeWordDetected
 
     // Hotkey actions
     case hotKeyPressed
@@ -85,6 +99,7 @@ struct TranscriptionFeature {
         // 2) Monitoring hot key events
         // 3) Priming the recorder for instant startup
         return .merge(
+          startWakeWordEffect(),
           startMeteringEffect(),
           startHotKeyMonitoringEffect(),
           warmUpRecorderEffect()
@@ -94,7 +109,15 @@ struct TranscriptionFeature {
 
       case let .audioLevelUpdated(meter):
         state.meter = meter
-        return .none
+        return handleMeterForHandsFree(&state, meter: meter)
+
+      case .wakeWordDetected:
+        // Ignore if we're already busy — Larry shouldn't interrupt himself.
+        guard !state.isRecording, !state.isTranscribing else { return .none }
+        state.isHandsFree = true
+        state.heardSpeech = false
+        state.lastVoiceAt = now
+        return .send(.startRecording)
 
       // MARK: - HotKey Flow
 
@@ -144,6 +167,66 @@ struct TranscriptionFeature {
         return handleDiscard(&state)
       }
     }
+  }
+}
+
+// MARK: - Hands-free silence detection
+
+private extension TranscriptionFeature {
+  /// Bridges "Hey Larry" detections into the reducer. Does nothing unless the
+  /// wake word is switched on, so the microphone is only held open when the
+  /// feature is actually wanted.
+  func startWakeWordEffect() -> Effect<Action> {
+    .run { send in
+      guard LarryWakeWord.isEnabled else { return }
+      let detections = AsyncStream<Void> { continuation in
+        Task { @MainActor in
+          LarryWakeWord.shared.onDetected = { continuation.yield(()) }
+          await LarryWakeWord.shared.start()
+        }
+        continuation.onTermination = { _ in
+          Task { @MainActor in LarryWakeWord.shared.stop() }
+        }
+      }
+      for await _ in detections {
+        await send(.wakeWordDetected)
+      }
+    }
+  }
+
+  /// How loud the input has to be to count as speech. Normalised power, so
+  /// this is roughly -34 dBFS — above room tone, below ordinary speech.
+  static let speechThreshold: Double = 0.02
+  /// Silence this long ends the utterance.
+  static let silenceToEnd: TimeInterval = 1.2
+  /// Never let a hands-free recording run away if the room is simply noisy.
+  static let handsFreeCeiling: TimeInterval = 30
+
+  /// Ends a hands-free recording once you stop talking, so there is never an
+  /// Enter to press. Hotkey recordings are untouched — those end on release.
+  func handleMeterForHandsFree(_ state: inout State, meter: Meter) -> Effect<Action> {
+    guard state.isHandsFree, state.isRecording else { return .none }
+
+    let isSpeech = meter.averagePower > Self.speechThreshold
+    if isSpeech {
+      state.heardSpeech = true
+      state.lastVoiceAt = now
+      return .none
+    }
+
+    // Bail out of a recording that is running long regardless of level.
+    if let start = state.recordingStartTime, now.timeIntervalSince(start) > Self.handsFreeCeiling {
+      transcriptionFeatureLogger.notice("Hands-free recording hit its ceiling; sending what we have")
+      return .send(.stopRecording)
+    }
+
+    // Only silence *after* speech ends the utterance — otherwise a pause
+    // before you begin would cut you off before you said anything.
+    guard state.heardSpeech, let last = state.lastVoiceAt else { return .none }
+    guard now.timeIntervalSince(last) >= Self.silenceToEnd else { return .none }
+
+    transcriptionFeatureLogger.info("Silence detected; auto-sending hands-free utterance")
+    return .send(.stopRecording)
   }
 }
 
@@ -298,6 +381,9 @@ private extension TranscriptionFeature {
     Task { @MainActor in
       LarryAudioPlayer.shared.stop()
       LarryHUD.shared.setState(.listening)
+      // The recorder needs sole ownership of the input node; two engines
+      // tapping the same device at once is unreliable.
+      LarryWakeWord.shared.suspend()
     }
 
     // Capture the active application
@@ -333,7 +419,10 @@ private extension TranscriptionFeature {
 
   func handleStopRecording(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
-    
+    state.isHandsFree = false
+    state.heardSpeech = false
+    state.lastVoiceAt = nil
+
     let stopTime = now
     let startTime = state.recordingStartTime
     let duration = startTime.map { stopTime.timeIntervalSince($0) } ?? 0
@@ -520,6 +609,10 @@ private extension TranscriptionFeature {
   ) async throws {
     @Shared(.hexSettings) var hexSettings: HexSettings
 
+    // Hand the microphone back to the wake word however this exits — the
+    // Larry branch below returns early, and a throw skips the tail entirely.
+    defer { Task { @MainActor in LarryWakeWord.shared.resume() } }
+
     if hexSettings.saveTranscriptionHistory {
       let transcript = try await transcriptPersistence.save(
         result,
@@ -576,6 +669,9 @@ private extension TranscriptionFeature {
     state.isTranscribing = false
     state.isRecording = false
     state.isPrewarming = false
+    state.isHandsFree = false
+    state.heardSpeech = false
+    state.lastVoiceAt = nil
 
     return .merge(
       .cancel(id: CancelID.transcription),

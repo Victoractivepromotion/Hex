@@ -1,0 +1,212 @@
+//
+//  LarryWakeWordClient.swift
+//  Hex — "Hey Larry" wake word
+//
+//  Listens continuously for the phrase "Hey Larry" and starts a recording when
+//  it hears it, so the hotkey becomes optional rather than required.
+//
+//  Design notes, and why it is built this way:
+//
+//  * Recognition is Apple's `SFSpeechRecognizer` pinned to on-device mode, not
+//    Parakeet. Wake-word spotting does not need transcription quality, and
+//    running Parakeet continuously would burn far more power for no benefit.
+//    On-device also means no audio leaves the Mac and it works offline.
+//
+//  * `SFSpeechRecognitionTask` stops on its own after roughly a minute of
+//    audio. A wake word that quietly dies after the first minute looks exactly
+//    like one that works, so the task is recycled on a timer well before that
+//    limit, and also restarted if it ends on its own.
+//
+//  * Hex's recorder owns the input node while it captures. Two engines tapping
+//    the same input device at once is unreliable, so this suspends itself for
+//    the duration of a recording and resumes afterwards — see `suspend()` and
+//    `resume()`, called from TranscriptionFeature.
+//
+//  Requires `INFOPLIST_KEY_NSSpeechRecognitionUsageDescription` in the target's
+//  build settings (alongside the existing microphone string).
+//
+
+import AVFoundation
+import Foundation
+import Speech
+import os
+
+private let wakeLog = Logger(subsystem: "com.kitlangton.Hex", category: "LarryWakeWord")
+
+@MainActor
+final class LarryWakeWord: NSObject {
+  static let shared = LarryWakeWord()
+
+  /// Called on the main actor when the phrase is heard.
+  var onDetected: (() -> Void)?
+
+  /// Wake word is opt-in: it holds the microphone open for as long as it runs,
+  /// which keeps the system mic indicator lit. Enable with
+  /// `defaults write com.kitlangton.Hex larryWakeWordEnabled -bool true`.
+  static var isEnabled: Bool {
+    UserDefaults.standard.bool(forKey: "larryWakeWordEnabled")
+  }
+
+  /// Spellings to accept. On-device recognition rarely returns the exact
+  /// casing or spelling of a name, and "Larry" lands on several near-misses —
+  /// including Danish-accented ones — so a small set beats an exact match.
+  private static let phrases = [
+    "hey larry", "hey lary", "hey larri", "hey laurie", "hey lari",
+    "hej larry", "hej lary", "hey harry", "hey lorry",
+  ]
+
+  /// Recycle the recognition task well inside the ~60s ceiling.
+  private static let taskLifetime: TimeInterval = 45
+
+  private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+  private var engine: AVAudioEngine?
+  private var request: SFSpeechAudioBufferRecognitionRequest?
+  private var task: SFSpeechRecognitionTask?
+  private var recycleTimer: Timer?
+
+  /// True while a recording owns the microphone.
+  private var isSuspended = false
+  private var isRunning = false
+
+  /// Guards against firing repeatedly while the phrase stays in the rolling
+  /// transcript — one detection per task generation.
+  private var hasFiredThisGeneration = false
+
+  // MARK: Lifecycle
+
+  /// Requests permission and starts listening. Safe to call more than once.
+  func start() async {
+    guard Self.isEnabled else { return }
+    guard let recognizer, recognizer.isAvailable else {
+      wakeLog.error("No speech recogniser available for en-US; wake word disabled")
+      return
+    }
+    guard recognizer.supportsOnDeviceRecognition else {
+      // Refuse rather than silently stream microphone audio to Apple's servers.
+      wakeLog.error("On-device recognition unavailable for en-US; wake word disabled")
+      return
+    }
+
+    let status = await withCheckedContinuation { continuation in
+      SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+    }
+    guard status == .authorized else {
+      wakeLog.error("Speech recognition not authorised (status \(status.rawValue))")
+      return
+    }
+
+    listen()
+  }
+
+  /// Stops listening and releases the microphone.
+  func stop() {
+    recycleTimer?.invalidate()
+    recycleTimer = nil
+    task?.cancel()
+    task = nil
+    request?.endAudio()
+    request = nil
+    if let engine {
+      engine.inputNode.removeTap(onBus: 0)
+      engine.stop()
+    }
+    engine = nil
+    isRunning = false
+  }
+
+  /// Called when Hex starts recording, so the recorder can own the input node.
+  func suspend() {
+    isSuspended = true
+    stop()
+  }
+
+  /// Called when a recording finishes.
+  func resume() {
+    guard isSuspended else { return }
+    isSuspended = false
+    Task { await start() }
+  }
+
+  // MARK: Listening
+
+  private func listen() {
+    guard !isSuspended, !isRunning else { return }
+    stop()
+
+    let engine = AVAudioEngine()
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    request.requiresOnDeviceRecognition = true
+
+    let inputNode = engine.inputNode
+    let format = inputNode.outputFormat(forBus: 0)
+    guard format.sampleRate > 0 else {
+      wakeLog.error("Input node reports a zero sample rate; is a microphone connected?")
+      return
+    }
+
+    inputNode.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
+      request.append(buffer)
+    }
+
+    engine.prepare()
+    do {
+      try engine.start()
+    } catch {
+      wakeLog.error("Wake-word engine failed to start: \(error.localizedDescription, privacy: .public)")
+      inputNode.removeTap(onBus: 0)
+      return
+    }
+
+    self.engine = engine
+    self.request = request
+    hasFiredThisGeneration = false
+    isRunning = true
+
+    task = recognizer?.recognitionTask(with: request) { [weak self] result, error in
+      Task { @MainActor in
+        guard let self else { return }
+        if let result {
+          self.inspect(result.bestTranscription.formattedString)
+        }
+        if error != nil || result?.isFinal == true {
+          // The task ended — recycle so listening does not silently stop.
+          self.restartSoon()
+        }
+      }
+    }
+
+    // Pre-empt the ~60s task ceiling.
+    recycleTimer = Timer.scheduledTimer(withTimeInterval: Self.taskLifetime, repeats: false) { [weak self] _ in
+      Task { @MainActor in self?.restartSoon() }
+    }
+
+    wakeLog.info("Wake word listening")
+  }
+
+  private func inspect(_ transcript: String) {
+    guard !hasFiredThisGeneration else { return }
+    let normalized = transcript
+      .lowercased()
+      .replacingOccurrences(of: "[^a-z ]", with: "", options: .regularExpression)
+    guard Self.phrases.contains(where: { normalized.contains($0) }) else { return }
+
+    hasFiredThisGeneration = true
+    wakeLog.info("Wake word detected")
+    onDetected?()
+    // Deliberately *not* suspending here. Suspension is owned solely by
+    // `handleStartRecording`/`finalize…`, which pair it with a resume. If a
+    // detection is dropped — say Larry is already answering — suspending here
+    // would leave the wake word off for good, with nothing to switch it back on.
+  }
+
+  private func restartSoon() {
+    guard !isSuspended else { return }
+    stop()
+    Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 200_000_000)
+      guard !self.isSuspended else { return }
+      self.listen()
+    }
+  }
+}
