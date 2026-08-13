@@ -84,6 +84,16 @@ final class LarryWakeWord: NSObject {
     "hej larry", "hej lary", "hey harry", "hey lorry",
   ]
 
+  /// Accepted *only* while Larry is speaking, to cut him off. Bare "larry" is
+  /// far too loose to arm the assistant from silence — the name comes up in
+  /// ordinary conversation — but while he is talking over you, the intent of
+  /// saying it is unambiguous and the cost of a false positive is merely that
+  /// he stops.
+  private static let bargeInPhrases = ["larry", "stop", "hold on", "wait"]
+
+  /// True while a reply is playing. Set by `LarryAudioPlayer`.
+  var isSpeaking = false
+
   /// Recycle the recognition task well inside the ~60s ceiling.
   private static let taskLifetime: TimeInterval = 45
 
@@ -244,7 +254,11 @@ final class LarryWakeWord: NSObject {
     let normalized = transcript
       .lowercased()
       .replacingOccurrences(of: "[^a-z ]", with: "", options: .regularExpression)
-    guard Self.phrases.contains(where: { normalized.contains($0) }) else { return }
+    var accepted = Self.phrases
+    if isSpeaking {
+      accepted += Self.bargeInPhrases
+    }
+    guard accepted.contains(where: { normalized.contains($0) }) else { return }
 
     hasFiredThisGeneration = true
     wakeLog.info("Wake word detected")

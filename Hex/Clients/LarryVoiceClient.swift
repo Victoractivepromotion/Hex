@@ -170,6 +170,10 @@ final class LarryAudioPlayer: NSObject, AVAudioPlayerDelegate {
   /// Plays `data`, returning once it has finished (or failed to start).
   func play(_ data: Data) async {
     stop()
+    // Tell the wake word a reply is playing, so it will also accept a bare
+    // "Larry" or "stop" as an interrupt for as long as he is talking.
+    LarryWakeWord.shared.isSpeaking = true
+    defer { LarryWakeWord.shared.isSpeaking = false }
     do {
       let player = try AVAudioPlayer(data: data)
       player.delegate = self
