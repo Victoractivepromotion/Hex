@@ -35,6 +35,9 @@ struct TranscriptionFeature {
     /// Whether this hands-free utterance has contained any speech yet, so a
     /// pause *before* you start talking cannot end it immediately.
     var heardSpeech: Bool = false
+    /// Loudest level seen during this utterance, used to calibrate the silence
+    /// threshold to how loud you actually are rather than a guessed constant.
+    var loudestThisUtterance: Double = 0
 
     var sourceAppBundleID: String?
     var sourceAppName: String?
@@ -116,6 +119,7 @@ struct TranscriptionFeature {
         guard !state.isRecording, !state.isTranscribing else { return .none }
         state.isHandsFree = true
         state.heardSpeech = false
+        state.loudestThisUtterance = 0
         state.lastVoiceAt = now
         return .send(.startRecording)
 
@@ -209,11 +213,22 @@ private extension TranscriptionFeature {
     }
   }
 
-  /// How loud the input has to be to count as speech. Normalised power, so
-  /// this is roughly -34 dBFS — above room tone, below ordinary speech.
-  static let speechThreshold: Double = 0.02
+  /// Absolute floor for what can count as speech. The meter is raw RMS from
+  /// the capture engine (roughly 0.001 for a quiet room, 0.02–0.1 for speech),
+  /// so this only has to clear room tone — the real decision is the relative
+  /// test below.
+  static let speechFloor: Double = 0.006
+  /// Speech is anything above this fraction of the loudest moment so far. A
+  /// fixed threshold cannot work for every microphone, distance and voice: too
+  /// high and your speech reads as silence so the recording never ends, too low
+  /// and room tone reads as speech so it also never ends. Calibrating against
+  /// your own peak sidesteps both.
+  static let speechRatio: Double = 0.18
   /// Silence this long ends the utterance.
   static let silenceToEnd: TimeInterval = 1.2
+  /// If no speech is ever detected, end well before the hard ceiling instead of
+  /// leaving the recording open — a mis-fired wake word shouldn't hang for 30s.
+  static let noSpeechTimeout: TimeInterval = 8
   /// Never let a hands-free recording run away if the room is simply noisy.
   static let handsFreeCeiling: TimeInterval = 30
 
@@ -222,25 +237,46 @@ private extension TranscriptionFeature {
   func handleMeterForHandsFree(_ state: inout State, meter: Meter) -> Effect<Action> {
     guard state.isHandsFree, state.isRecording else { return .none }
 
-    let isSpeech = meter.averagePower > Self.speechThreshold
-    if isSpeech {
+    let level = meter.averagePower
+    state.loudestThisUtterance = max(state.loudestThisUtterance, level)
+
+    // Calibrate against how loud this speaker actually is, with an absolute
+    // floor so a silent room can never talk itself into a high bar.
+    let threshold = max(Self.speechFloor, state.loudestThisUtterance * Self.speechRatio)
+    if level > threshold {
       state.heardSpeech = true
       state.lastVoiceAt = now
       return .none
     }
 
+    let elapsed = state.recordingStartTime.map { now.timeIntervalSince($0) } ?? 0
+
     // Bail out of a recording that is running long regardless of level.
-    if let start = state.recordingStartTime, now.timeIntervalSince(start) > Self.handsFreeCeiling {
-      transcriptionFeatureLogger.notice("Hands-free recording hit its ceiling; sending what we have")
+    if elapsed > Self.handsFreeCeiling {
+      transcriptionFeatureLogger.notice(
+        "Hands-free recording hit its ceiling (peak \(state.loudestThisUtterance)); sending what we have"
+      )
       return .send(.stopRecording)
     }
 
-    // Only silence *after* speech ends the utterance — otherwise a pause
-    // before you begin would cut you off before you said anything.
-    guard state.heardSpeech, let last = state.lastVoiceAt else { return .none }
+    // Never heard anything speech-like — don't hold the recording open.
+    guard state.heardSpeech, let last = state.lastVoiceAt else {
+      if elapsed > Self.noSpeechTimeout {
+        transcriptionFeatureLogger.notice(
+          "Hands-free recording heard no speech in \(Self.noSpeechTimeout)s (peak \(state.loudestThisUtterance)); ending"
+        )
+        return .send(.stopRecording)
+      }
+      return .none
+    }
+
+    // Silence *after* speech ends the utterance — a pause before you begin
+    // must not cut you off before you have said anything.
     guard now.timeIntervalSince(last) >= Self.silenceToEnd else { return .none }
 
-    transcriptionFeatureLogger.info("Silence detected; auto-sending hands-free utterance")
+    transcriptionFeatureLogger.info(
+      "Silence detected after speech (peak \(state.loudestThisUtterance)); auto-sending"
+    )
     return .send(.stopRecording)
   }
 }
@@ -461,6 +497,7 @@ private extension TranscriptionFeature {
     state.isHandsFree = false
     state.heardSpeech = false
     state.lastVoiceAt = nil
+    state.loudestThisUtterance = 0
 
     let stopTime = now
     let startTime = state.recordingStartTime
@@ -711,6 +748,7 @@ private extension TranscriptionFeature {
     state.isHandsFree = false
     state.heardSpeech = false
     state.lastVoiceAt = nil
+    state.loudestThisUtterance = 0
 
     return .merge(
       .cancel(id: CancelID.transcription),
