@@ -87,11 +87,17 @@ final class LarryWakeWord: NSObject {
   /// Recycle the recognition task well inside the ~60s ceiling.
   private static let taskLifetime: TimeInterval = 45
 
+  /// Longest a suspension may last before the watchdog forces a resume. Comfortably
+  /// past a normal utterance plus Larry's ~40s reply, so it only fires on a genuine
+  /// missed resume.
+  private static let maxSuspension: TimeInterval = 90
+
   private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
   private var engine: AVAudioEngine?
   private var request: SFSpeechAudioBufferRecognitionRequest?
   private var task: SFSpeechRecognitionTask?
   private var recycleTimer: Timer?
+  private var suspendWatchdog: Timer?
 
   /// True while a recording owns the microphone.
   private var isSuspended = false
@@ -147,10 +153,28 @@ final class LarryWakeWord: NSObject {
   func suspend() {
     isSuspended = true
     stop()
+
+    // Watchdog. A suspension that never gets its matching resume leaves the
+    // wake word silently dead until the app is restarted — indistinguishable,
+    // from the outside, from it simply not working. Every caller is paired
+    // today, but this failure is invisible and the recovery is free, so time
+    // the suspension out rather than trusting every future path to be correct.
+    suspendWatchdog?.invalidate()
+    suspendWatchdog = Timer.scheduledTimer(
+      withTimeInterval: Self.maxSuspension, repeats: false
+    ) { [weak self] _ in
+      Task { @MainActor in
+        guard let self, self.isSuspended else { return }
+        wakeLog.error("Suspension exceeded \(Self.maxSuspension)s with no resume — recovering")
+        self.resume()
+      }
+    }
   }
 
   /// Called when a recording finishes.
   func resume() {
+    suspendWatchdog?.invalidate()
+    suspendWatchdog = nil
     guard isSuspended else { return }
     isSuspended = false
     // A mute set while recording must outlive the automatic pause.

@@ -492,8 +492,19 @@ private extension TranscriptionFeature {
     )
   }
 
+  /// Hands the microphone back to the wake word. Called from every path that
+  /// ends a recording — stop, cancel, discard and transcription failure — not
+  /// just the successful one. Suspension is set on every recording start, so a
+  /// single discarded or failed utterance would otherwise leave the wake word
+  /// switched off until the app was restarted, which looks exactly like it
+  /// simply stopped working.
+  func resumeWakeWord() {
+    Task { @MainActor in LarryWakeWord.shared.resume() }
+  }
+
   func handleStopRecording(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
+    resumeWakeWord()
     state.isHandsFree = false
     state.heardSpeech = false
     state.lastVoiceAt = nil
@@ -663,6 +674,7 @@ private extension TranscriptionFeature {
     error: Error,
     audioURL: URL?
   ) -> Effect<Action> {
+    resumeWakeWord()
     state.isTranscribing = false
     state.isPrewarming = false
     state.error = error.localizedDescription
@@ -741,6 +753,7 @@ private extension TranscriptionFeature {
 
 private extension TranscriptionFeature {
   func handleCancel(_ state: inout State) -> Effect<Action> {
+    resumeWakeWord()
     let wasRecording = state.isRecording
     state.isTranscribing = false
     state.isRecording = false
@@ -771,6 +784,7 @@ private extension TranscriptionFeature {
   }
 
   func handleDiscard(_ state: inout State) -> Effect<Action> {
+    resumeWakeWord()
     state.isRecording = false
     state.isPrewarming = false
 
