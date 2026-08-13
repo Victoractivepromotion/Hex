@@ -12,6 +12,9 @@ jobs:
   build-dmg:
     runs-on: macos-15
     timeout-minutes: 40
+    # Needed to publish the rolling prerelease below.
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,3 +72,26 @@ jobs:
           name: Hex-dmg
           path: Hex.dmg
           if-no-files-found: error
+
+      # Actions artifacts require an authenticated download even on a public
+      # repo, which means every test build has to be fetched by hand from a
+      # browser. Release assets on a public repo do not — so the same DMG is
+      # also published as a rolling prerelease at a stable URL:
+      #
+      #   https://github.com/Victoractivepromotion/Hex/releases/download/heylarry-latest/Hex.dmg
+      #
+      # That URL always serves the newest heylarry build and can be curled
+      # directly, so installing never needs a manual download again.
+      - name: Publish rolling prerelease
+        if: github.ref_name == 'heylarry'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Replace the previous rolling release so the tag always points at
+          # this build; ignore failure on the first run when it doesn't exist.
+          gh release delete heylarry-latest --yes --cleanup-tag || true
+          gh release create heylarry-latest Hex.dmg \
+            --prerelease \
+            --title "Hey Larry — rolling build" \
+            --notes "Unsigned rolling build of the heylarry branch (commit ${GITHUB_SHA}). Replaced on every push."
