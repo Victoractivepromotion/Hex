@@ -239,6 +239,10 @@ private extension TranscriptionFeature {
 
     let level = meter.averagePower
     state.loudestThisUtterance = max(state.loudestThisUtterance, level)
+    // Read into a local before any logging below: os.Logger interpolation is an
+    // escaping autoclosure, and Swift refuses to let one capture an inout
+    // parameter.
+    let peak = state.loudestThisUtterance
 
     // Calibrate against how loud this speaker actually is, with an absolute
     // floor so a silent room can never talk itself into a high bar.
@@ -254,7 +258,7 @@ private extension TranscriptionFeature {
     // Bail out of a recording that is running long regardless of level.
     if elapsed > Self.handsFreeCeiling {
       transcriptionFeatureLogger.notice(
-        "Hands-free recording hit its ceiling (peak \(state.loudestThisUtterance)); sending what we have"
+        "Hands-free recording hit its ceiling (peak \(peak)); sending what we have"
       )
       return .send(.stopRecording)
     }
@@ -263,7 +267,7 @@ private extension TranscriptionFeature {
     guard state.heardSpeech, let last = state.lastVoiceAt else {
       if elapsed > Self.noSpeechTimeout {
         transcriptionFeatureLogger.notice(
-          "Hands-free recording heard no speech in \(Self.noSpeechTimeout)s (peak \(state.loudestThisUtterance)); ending"
+          "Hands-free recording heard no speech in \(Self.noSpeechTimeout)s (peak \(peak)); ending"
         )
         return .send(.stopRecording)
       }
@@ -275,7 +279,7 @@ private extension TranscriptionFeature {
     guard now.timeIntervalSince(last) >= Self.silenceToEnd else { return .none }
 
     transcriptionFeatureLogger.info(
-      "Silence detected after speech (peak \(state.loudestThisUtterance)); auto-sending"
+      "Silence detected after speech (peak \(peak)); auto-sending"
     )
     return .send(.stopRecording)
   }
