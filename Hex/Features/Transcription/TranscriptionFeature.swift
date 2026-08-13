@@ -292,7 +292,14 @@ private extension TranscriptionFeature {
     state.isRecording = true
     let startTime = now
     state.recordingStartTime = startTime
-    
+
+    // Barge-in: cut Larry off the moment you start speaking, so he isn't
+    // still answering the last question over the top of the new one.
+    Task { @MainActor in
+      LarryAudioPlayer.shared.stop()
+      LarryHUD.shared.setState(.listening)
+    }
+
     // Capture the active application
     if let activeApp = NSWorkspace.shared.frontmostApplication {
       state.sourceAppBundleID = activeApp.bundleIdentifier
@@ -542,11 +549,17 @@ private extension TranscriptionFeature {
     // Hey Larry: route the spoken text to Larry's voice brain and speak the
     // reply instead of pasting raw dictation. Falls back to paste on failure.
     if LarryVoice.isEnabled {
+      await MainActor.run { LarryHUD.shared.setState(.thinking) }
       do {
         _ = try await LarryVoice.ask(result)
+        await MainActor.run { LarryHUD.shared.setState(.standby) }
         return
       } catch {
         // Endpoint unreachable/slow — degrade gracefully to normal dictation.
+        transcriptionFeatureLogger.error(
+          "Larry unavailable, pasting transcript instead: \(error.localizedDescription, privacy: .public)"
+        )
+        await MainActor.run { LarryHUD.shared.setState(.standby) }
       }
     }
 

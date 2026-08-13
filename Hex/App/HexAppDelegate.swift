@@ -32,6 +32,11 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			await soundEffect.preloadSounds()
 			await soundEffect.setEnabled(hexSettings.soundEffectsEnabled)
 		}
+
+		// Hey Larry boot chime. Fire-and-forget: the clip runs ~18s and must not
+		// hold up launch or the first utterance.
+		Task { await LarryStartupSound.play() }
+
 		launchedAtLogin = wasLaunchedAtLogin()
 		appLogger.info("Application did finish launching")
 		appLogger.notice("launchedAtLogin = \(self.launchedAtLogin)")

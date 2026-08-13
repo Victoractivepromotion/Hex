@@ -16,6 +16,10 @@ struct HexApp: App {
         MenuBarExtra {
             MenuBarCopyLastTranscriptButton()
 
+            Button("Larry Command Center") {
+                LarryHUD.shared.toggle()
+            }.keyboardShortcut("l")
+
             Button("Settings…") {
                 appDelegate.presentSettingsView()
             }.keyboardShortcut(",")
