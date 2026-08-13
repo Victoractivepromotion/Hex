@@ -8,6 +8,13 @@ on:
     branches: [main, heylarry]
   workflow_dispatch:
 
+# Two overlapping runs both publish, and whichever finishes last wins — a
+# failed build for an older commit once replaced a good DMG with just its
+# error log. Newest push wins; older in-flight runs are cancelled.
+concurrency:
+  group: build-dmg-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-dmg:
     runs-on: macos-15
@@ -95,8 +102,24 @@ jobs:
       #
       # That URL always serves the newest heylarry build and can be curled
       # directly, so installing never needs a manual download again.
+      - name: Publish diagnostics (failed build)
+        if: failure() && github.ref_name == 'heylarry'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Deliberately a different tag from the DMG release: a failed build
+          # must never overwrite the last good installer.
+          gh release delete heylarry-diagnostics --yes --cleanup-tag || true
+          if [ -f build-errors.log ]; then
+            gh release create heylarry-diagnostics build-errors.log \
+              --prerelease \
+              --title "Hey Larry — last failed build" \
+              --notes "Compiler diagnostics for commit ${GITHUB_SHA}."
+          fi
+
       - name: Publish rolling prerelease
-        if: always() && github.ref_name == 'heylarry'
+        if: success() && github.ref_name == 'heylarry'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -109,14 +132,7 @@ jobs:
           # `[ -f ] &&` returns non-zero when the file is missing, which would
           # kill the step under set -e, and an empty array trips set -u — hence
           # the explicit guards.
-          assets=()
-          if [ -f Hex.dmg ]; then assets+=(Hex.dmg); fi
-          if [ -f build-errors.log ]; then assets+=(build-errors.log); fi
-          if [ ${#assets[@]} -eq 0 ]; then
-            echo "nothing to publish" >&2
-            exit 0
-          fi
-          gh release create heylarry-latest "${assets[@]}" \
+          gh release create heylarry-latest Hex.dmg \
             --prerelease \
             --title "Hey Larry — rolling build" \
             --notes "Unsigned rolling build of the heylarry branch (commit ${GITHUB_SHA}). Replaced on every push."
